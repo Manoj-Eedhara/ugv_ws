@@ -6,7 +6,7 @@ import rclpy
 from rclpy.node import Node
 import logging
 import time
-from std_msgs.msg import Header, Float32MultiArray, Float32
+from std_msgs.msg import Header, Float32MultiArray, Float32, String
 from geometry_msgs.msg import Twist
 from sensor_msgs.msg import Imu, MagneticField
 import math
@@ -47,6 +47,7 @@ class ReadLine:
 
     # Clear the buffer
     def clear_buffer(self):
+        self.buf = bytearray()  # also clear the Python-side buffer
         self.s.reset_input_buffer()
 
 # Base controller class for managing UART communication and processing commands
@@ -62,19 +63,40 @@ class BaseController:
         # Base data structure to hold sensor values
         self.base_data = {"T": 1001, "L": 0, "R": 0, "ax": 0, "ay": 0, "az": 0, "gx": 0, "gy": 0, "gz": 0, "mx": 0, "my": 0, "mz": 0, "odl": 0, "odr": 0, "v": 0}
     
+    # Extract the first complete, balanced JSON object from a raw serial line.
+    # Handles framing noise (T{ prefix), double-object lines, and stray braces.
+    @staticmethod
+    def _extract_json(raw):
+        depth = 0
+        start = -1
+        for i, ch in enumerate(raw):
+            if ch == '{':
+                if depth == 0:
+                    start = i
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0 and start >= 0:
+                    return raw[start:i + 1]
+        return None
+
     # Function to read and return feedback data from the serial input
     def feedback_data(self):
         try:
-            line = self.rl.readline().decode('utf-8')  # Read line from UART
-            self.data_buffer = json.loads(line)  # Parse JSON data
-            self.base_data = self.data_buffer  # Store received data
-            return self.base_data  # Return base data
-        except json.JSONDecodeError as e:
-            self.logger.error(f"JSON decode error: {e} with line: {line}")  # Log error
-            self.rl.clear_buffer()  # Clear buffer on error
+            raw = self.rl.readline().decode('utf-8', errors='ignore')
+            candidate = self._extract_json(raw)
+            if candidate is None:
+                return self.base_data
+            parsed = json.loads(candidate)
+            if isinstance(parsed, dict) and "T" in parsed:
+                self.base_data = parsed
+            return self.base_data
+        except json.JSONDecodeError:
+            self.rl.clear_buffer()
         except Exception as e:
             self.logger.error(f"[base_ctrl.feedback_data] unexpected error: {e}")
             self.rl.clear_buffer()
+            time.sleep(0.05)  # Brief pause before retrying after hardware error
 
     # Receive and decode data from the serial connection
     def on_data_received(self):
@@ -90,7 +112,10 @@ class BaseController:
     def process_commands(self):
         while True:
             data = self.command_queue.get()  # Get command from the queue
-            self.ser.write((json.dumps(data) + '\n').encode("utf-8"))  # Send command as JSON over UART
+            if isinstance(data, str):
+                self.ser.write((data + '\n').encode("utf-8"))
+            else:
+                self.ser.write((json.dumps(data) + '\n').encode("utf-8"))
 
     # Send control data as JSON via UART
     def base_json_ctrl(self, input_json):
@@ -107,13 +132,19 @@ class ugv_bringup(Node):
         self.voltage_publisher_ = self.create_publisher(Float32, "voltage", 50)
         # Initialize the base controller with the UART port and baud rate
         self.base_controller = BaseController(serial_port, 115200)
+        # Subscribe to serial commands from ugv_driver (single port owner)
+        self.serial_cmd_sub = self.create_subscription(
+            String, 'ugv/serial_cmd', self.serial_cmd_callback, 10)
         # Timer to periodically execute the feedback loop
         self.feedback_timer = self.create_timer(0.001, self.feedback_loop)
+
+    def serial_cmd_callback(self, msg):
+        self.base_controller.send_command(msg.data)
 
     # Main loop for reading sensor feedback and publishing it to ROS topics
     def feedback_loop(self):
         self.base_controller.feedback_data()
-        if self.base_controller.base_data["T"] == 1001:  # Check if the feedback type is correct
+        if self.base_controller.base_data.get("T") == 1001:  # Check if the feedback type is correct
             self.publish_imu_data_raw()  # Publish IMU raw data
             self.publish_imu_mag()  # Publish magnetic field data
             self.publish_odom_raw()  # Publish odometry data
