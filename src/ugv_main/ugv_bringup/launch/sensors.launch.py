@@ -1,7 +1,7 @@
 from launch import LaunchDescription
-from launch_ros.actions import Node
+from launch_ros.actions import Node, SetRemap, PushRosNamespace
 import os
-from launch.actions import IncludeLaunchDescription, DeclareLaunchArgument
+from launch.actions import IncludeLaunchDescription, DeclareLaunchArgument, GroupAction
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PythonExpression
 from ament_index_python.packages import get_package_share_directory
@@ -19,18 +19,33 @@ def generate_launch_description():
     def nst(path):
         return PythonExpression(["'/' + '", ns, "' + '/" + path + "'"])
 
+    def nsf(frame):
+        """Return a namespaced TF frame ID: <robot_name>/<frame>"""
+        return PythonExpression(["'", ns, "' + '/" + frame + "'"])
+
     pkg_desc    = get_package_share_directory('ugv_description')
 
-    # Robot model — provides base_footprint → base_lidar_link and base_imu_link TF
-    robot_state_launch = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            os.path.join(pkg_desc, 'launch', 'display.launch.py')
+    # Robot model — provides base_footprint → base_lidar_link and base_imu_link TF.
+    # PushRosNamespace puts all display.launch.py topics under /<robot_name>/.
+    # SetRemap converts the absolute /tf, /tf_static to relative so they land
+    # inside the pushed namespace instead of the global topic.
+    robot_state_launch = GroupAction([
+        PushRosNamespace(ns),
+        SetRemap(src='/tf', dst='tf'),
+        SetRemap(src='/tf_static', dst='tf_static'),
+        IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(
+                os.path.join(pkg_desc, 'launch', 'display.launch.py')
+            ),
+            launch_arguments={
+                'use_rviz': LaunchConfiguration('use_rviz'),
+                'rviz_config': 'bringup',
+                'frame_prefix': ns,
+            }.items()
         ),
-        launch_arguments={
-            'use_rviz': LaunchConfiguration('use_rviz'),
-            'rviz_config': 'bringup',
-        }.items()
-    )
+    ])
+
+    tf_remaps = [('/tf', nst('tf')), ('/tf_static', nst('tf_static'))]
 
     # MCU serial comms — raw IMU from the base controller
     # Publishes: /{ns}/imu/data_raw, /{ns}/imu/mag, /{ns}/voltage
@@ -43,7 +58,7 @@ def generate_launch_description():
             ('odom/odom_raw',  nst('odom/odom_raw')),
             ('voltage',        nst('voltage')),
             ('ugv/serial_cmd', nst('serial_cmd')),
-        ]
+        ] + tf_remaps
     )
 
     # IMU complementary filter — adds orientation quaternion
@@ -64,7 +79,7 @@ def generate_launch_description():
             ('imu/data_raw', nst('imu/data_raw')),
             ('imu/mag',      nst('imu/mag')),
             ('imu/data',     nst('imu/data')),
-        ]
+        ] + tf_remaps
     )
 
     # Motor / servo / LED driver
@@ -78,7 +93,7 @@ def generate_launch_description():
             ('ugv/serial_cmd',   nst('serial_cmd')),
             ('ugv/joint_states', nst('joint_states')),
             ('ugv/led_ctrl',     nst('led_ctrl')),
-        ]
+        ] + tf_remaps
     )
 
     # LiDAR LD06
@@ -91,7 +106,7 @@ def generate_launch_description():
         parameters=[
             {'product_name': 'LDLiDAR_LD06'},
             {'topic_name': nst('scan')},
-            {'frame_id': 'base_lidar_link'},
+            {'frame_id': nsf('base_lidar_link')},
             {'port_name': '/dev/ttyUSB0'},
             {'port_baudrate': 230400},
             {'laser_scan_dir': True},

@@ -1,4 +1,5 @@
 import os
+import xml.etree.ElementTree as ET
 from launch import LaunchDescription
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
@@ -42,29 +43,49 @@ def get_rviz_config_file(context):
 def launch_setup(context, *args, **kwargs):
 
     rviz_config = context.launch_configurations['rviz_config']
+    frame_prefix = context.launch_configurations.get('frame_prefix', '')
     UGV_MODEL = os.environ['UGV_MODEL']
     urdf_file_name = UGV_MODEL + '.urdf'
     urdf_model_path = os.path.join(
         get_package_share_directory('ugv_description'),
-        'urdf', 
-        urdf_file_name)      
-        
+        'urdf',
+        urdf_file_name)
+
+    # When frame_prefix is set, prefix every link name in the URDF so that
+    # robot_state_publisher publishes TF frames like <prefix>/base_link.
+    with open(urdf_model_path, 'r') as f:
+        urdf_content = f.read()
+
+    if frame_prefix:
+        root_elem = ET.fromstring(urdf_content)
+        for link_elem in root_elem.iter('link'):
+            name = link_elem.get('name')
+            if name:
+                link_elem.set('name', frame_prefix + '/' + name)
+        for joint_elem in root_elem.iter('joint'):
+            parent = joint_elem.find('parent')
+            child = joint_elem.find('child')
+            if parent is not None and parent.get('link'):
+                parent.set('link', frame_prefix + '/' + parent.get('link'))
+            if child is not None and child.get('link'):
+                child.set('link', frame_prefix + '/' + child.get('link'))
+        urdf_content = ET.tostring(root_elem, encoding='unicode')
+
     # Determine whether to use the joint_state_publisher_gui based on the rviz configuration
     use_joint_state_publisher_gui = 'true' if rviz_config == 'description' else context.launch_configurations.get('use_joint_state_publisher_gui', 'false')
 
-    # Define the robot_state_publisher node to publish the robot's URDF model
+    # No hardcoded namespace — the parent launch (e.g. sensors.launch.py) applies
+    # PushRosNamespace via GroupAction so all topics land under /<robot_name>/.
     robot_state_publisher_node = Node(
         package='robot_state_publisher',
         executable='robot_state_publisher',
-        namespace='ugv',
-        arguments=[urdf_model_path]
+        parameters=[{'robot_description': urdf_content}]
     )
 
     # Define the joint_state_publisher_gui node if the GUI is enabled
     joint_state_publisher_gui_node = Node(
         package='joint_state_publisher_gui',
         executable='joint_state_publisher_gui',
-        namespace='ugv',
         name='joint_state_publisher_gui',
         arguments=[urdf_model_path],
         condition=IfCondition(use_joint_state_publisher_gui)
@@ -74,7 +95,6 @@ def launch_setup(context, *args, **kwargs):
     joint_state_publisher_node = Node(
         package='joint_state_publisher',
         executable='joint_state_publisher',
-        namespace='ugv',
         name='joint_state_publisher',
         arguments=[urdf_model_path],
         condition=UnlessCondition(use_joint_state_publisher_gui)
@@ -110,6 +130,8 @@ def generate_launch_description():
         DeclareLaunchArgument('use_rviz', default_value='false', description='Whether to launch RViz2'),
         # Argument to specify which RViz configuration to use
         DeclareLaunchArgument('rviz_config', default_value='description', description='Choose which rviz configuration to use: description, bringup, slam_2d, slam_3d, nav_2d, nav_3d'),
+        # Prefix added to every URDF link name so TF frames become <prefix>/base_link etc.
+        DeclareLaunchArgument('frame_prefix', default_value='', description='Prefix for TF frame IDs (e.g. rover1). Empty = no prefix.'),
         # Opaque function to execute the setup
         OpaqueFunction(function=launch_setup)
     ])
